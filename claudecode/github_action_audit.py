@@ -21,6 +21,7 @@ from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.constants import (
     EXIT_CONFIGURATION_ERROR,
     DEFAULT_CLAUDE_MODEL,
+    FILTER_CLAUDE_MODEL,
     EXIT_SUCCESS,
     EXIT_GENERAL_ERROR,
     SUBPROCESS_TIMEOUT
@@ -416,6 +417,7 @@ def initialize_findings_filter(custom_filtering_instructions: Optional[str] = No
             return FindingsFilter(
                 use_hard_exclusions=True,
                 use_claude_filtering=True,
+                model=FILTER_CLAUDE_MODEL,
                 api_key=api_key,
                 custom_filtering_instructions=custom_filtering_instructions
             )
@@ -526,6 +528,11 @@ def main():
             repo_name, pr_number = get_environment_config()
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
+            sys.exit(EXIT_CONFIGURATION_ERROR)
+
+        # SuperSeed fork: the model comes from the caller's broker read, never from here.
+        if not DEFAULT_CLAUDE_MODEL:
+            print(json.dumps({'error': 'CLAUDE_MODEL is not set: the caller must pass the model its broker read assigned'}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
         
         # Load custom filtering instructions if provided
