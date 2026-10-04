@@ -132,9 +132,76 @@ class GitHubActionClient:
         headers['Accept'] = 'application/vnd.github.diff'
         
         response = requests.get(url, headers=headers)
+        if response.status_code == 406:
+            # GitHub refuses to render a diff above its size limit (superseedvc/
+            # superseed-internal#9380). Build the same base...head diff from git
+            # in the checked-out head tree instead of failing the scan.
+            print("[Debug] Diff endpoint answered 406; building the diff locally", file=sys.stderr)
+            return self._filter_generated_files(self._local_pr_diff(repo_name, pr_number))
         response.raise_for_status()
         
         return self._filter_generated_files(response.text)
+
+    def _local_pr_diff(self, repo_name: str, pr_number: int) -> str:
+        """The pull request's diff (merge base to head) computed by git.
+
+        The head commit must be what REPO_PATH has checked out, so the diff is
+        of the pull request's own head. The merge base comes from the compare
+        API and is fetched by SHA when the shallow checkout lacks it. The token
+        reaches git through GIT_CONFIG_* environment variables, never argv.
+        External diff drivers, textconv and hooks are switched off, because the
+        head tree is attacker-authored and its .gitattributes could name them.
+        """
+        pr_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+        response = requests.get(pr_url, headers=self.headers)
+        response.raise_for_status()
+        pr = response.json()
+        base_sha = pr['base']['sha']
+        head_sha = pr['head']['sha']
+
+        compare_url = (f"https://api.github.com/repos/{repo_name}/compare/"
+                       f"{base_sha}...{head_sha}?per_page=1")
+        response = requests.get(compare_url, headers=self.headers)
+        response.raise_for_status()
+        merge_base = response.json()['merge_base_commit']['sha']
+
+        repo_dir = os.environ.get('REPO_PATH') or os.getcwd()
+        safe = ['-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=']
+
+        def git(*args, env=None):
+            return subprocess.run(['git', '-C', repo_dir, *safe, *args],
+                                  capture_output=True, text=True, env=env,
+                                  timeout=600)
+
+        checked_out = git('rev-parse', 'HEAD')
+        if checked_out.returncode != 0 or checked_out.stdout.strip() != head_sha:
+            raise AuditError(
+                f"local diff refused: {repo_dir} has {checked_out.stdout.strip() or 'no commit'} "
+                f"checked out, not the pull request head {head_sha}")
+
+        if git('cat-file', '-e', f'{merge_base}^{{commit}}').returncode != 0:
+            import base64
+            basic = base64.b64encode(f"x-access-token:{self.github_token}".encode()).decode()
+            env = dict(os.environ)
+            env.update({
+                'GIT_CONFIG_COUNT': '1',
+                'GIT_CONFIG_KEY_0': 'http.https://github.com/.extraheader',
+                'GIT_CONFIG_VALUE_0': f'AUTHORIZATION: basic {basic}',
+                'GIT_TERMINAL_PROMPT': '0',
+            })
+            fetched = git('fetch', '--no-tags', '--depth=1',
+                          f'https://github.com/{repo_name}.git', merge_base, env=env)
+            if fetched.returncode != 0:
+                raise AuditError(f"local diff: could not fetch merge base {merge_base}: "
+                                 f"{fetched.stderr.strip()[:300]}")
+
+        diff = git('diff', '--no-ext-diff', '--no-textconv', '--no-color',
+                   merge_base, head_sha)
+        if diff.returncode != 0:
+            raise AuditError(f"local diff: git diff failed: {diff.stderr.strip()[:300]}")
+        if not diff.stdout.strip():
+            raise AuditError(f"local diff: git produced an empty diff for {merge_base}..{head_sha}")
+        return diff.stdout
     
     def _is_excluded(self, filepath: str) -> bool:
         """Check if a file should be excluded based on directory patterns."""
