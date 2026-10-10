@@ -15,7 +15,12 @@ import re
 import time 
 
 # Import existing components we can reuse
-from claudecode.prompts import get_security_audit_prompt
+from claudecode.prompts import (
+    PROMPT_TEMPLATE_ENV,
+    get_security_audit_prompt,
+    load_prompt_template,
+    render_prompt_template,
+)
 from claudecode.findings_filter import FindingsFilter
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.constants import (
@@ -268,7 +273,7 @@ class SimpleClaudeRunner:
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
     
-    def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
+    def run_security_audit(self, repo_dir: Path, prompt: str, system_prompt: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
         
         Args:
@@ -295,6 +300,10 @@ class SimpleClaudeRunner:
                 '--model', DEFAULT_CLAUDE_MODEL,
                 '--disallowed-tools', 'Bash(ps:*)'
             ]
+            # SuperSeed fork (#10267): a rendered prompt variant's system text, appended to the
+            # CLI's own system prompt as the bank sent it in the system turn.
+            if system_prompt:
+                cmd += ['--append-system-prompt', system_prompt]
             
             # Run Claude Code with retry logic
             NUM_RETRIES = 3
@@ -624,6 +633,21 @@ def main():
             except Exception as e:
                 logger.warning(f"Failed to read security scan instructions file {scan_file}: {e}")
         
+        # SuperSeed fork (#10267): the prompt variant the caller rendered for its model. A
+        # variable that names a file this cannot read is refused, never ignored: the caller
+        # has already logged the variant it meant to send.
+        prompt_template = None
+        template_file = os.environ.get(PROMPT_TEMPLATE_ENV, '')
+        if template_file:
+            try:
+                prompt_template = load_prompt_template(template_file)
+            except (OSError, ValueError) as e:
+                print(json.dumps({'error': f'{PROMPT_TEMPLATE_ENV} names a prompt template that cannot be used: {e}'}))
+                sys.exit(EXIT_CONFIGURATION_ERROR)
+            print(f"[Info] scan prompt: variant {prompt_template['variant']} from {template_file}", file=sys.stderr)
+        else:
+            print("[Info] scan prompt: the scanner's own (no prompt template named)", file=sys.stderr)
+
         # Initialize components
         try:
             github_client, claude_runner = initialize_clients()
@@ -653,20 +677,27 @@ def main():
             sys.exit(EXIT_GENERAL_ERROR)
                 
         # Generate security audit prompt
-        prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
-        
-        # Run Claude Code security audit
-        # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
-        success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
+        if prompt_template:
+            system_prompt, prompt = render_prompt_template(prompt_template, pr_data, pr_diff)
+            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt, system_prompt=system_prompt)
+        else:
+            prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
+            # Run Claude Code security audit
+            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
         
         # If prompt is too long, retry without diff
         if not success and error_msg == "PROMPT_TOO_LONG":
             print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
-            prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
-            print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
-            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
+            if prompt_template:
+                system_prompt, prompt_without_diff = render_prompt_template(prompt_template, pr_data, pr_diff, include_diff=False)
+                print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
+                success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff, system_prompt=system_prompt)
+            else:
+                prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
+                print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
+                success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))

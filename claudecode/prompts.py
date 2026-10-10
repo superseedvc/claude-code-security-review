@@ -1,5 +1,55 @@
 """Security audit prompt templates."""
 
+import json
+import re
+
+# SuperSeed fork (superseedvc/superseed-internal#10267): the caller may name a JSON file holding
+# the prompt variant its bank measured for the model it assigns. The file is
+# {"variant": name, "system": text, "user": text}; the user text carries the tokens below and
+# must carry {{PR_DIFF}}. Without the variable the scanner's own prompt is sent, unchanged.
+PROMPT_TEMPLATE_ENV = 'SECURITY_SCAN_PROMPT_TEMPLATE'
+
+_TOKEN = re.compile(r"\{\{(PR_[A-Z_]+)\}\}")
+
+DIFF_OMITTED = (
+    "(The diff was omitted because of its size. Use the file exploration tools to read the "
+    "files listed above, which this pull request changes.)"
+)
+
+
+def load_prompt_template(path):
+    """Read and check the caller's rendered prompt variant. Raises ValueError on any defect."""
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: the prompt template is not a JSON object")
+    for key in ('variant', 'system', 'user'):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise ValueError(f"{path}: the prompt template has no {key!r} text")
+    if '{{PR_DIFF}}' not in data['user']:
+        raise ValueError(f"{path}: the prompt template's user text has no {{{{PR_DIFF}}}} slot")
+    return data
+
+
+def render_prompt_template(template, pr_data, pr_diff=None, include_diff=True):
+    """Fill in the pull request, in ONE pass, so a token inside the pull request's own text
+    (its title, a file name, the diff) is never substituted again. Returns (system, user)."""
+    values = {
+        'PR_NUMBER': str(pr_data['number']),
+        'PR_TITLE': str(pr_data['title']),
+        'PR_AUTHOR': str(pr_data['user']),
+        'PR_REPO': pr_data.get('head', {}).get('repo', {}).get('full_name', 'unknown'),
+        'PR_CHANGED_FILES': str(pr_data['changed_files']),
+        'PR_ADDITIONS': str(pr_data['additions']),
+        'PR_DELETIONS': str(pr_data['deletions']),
+        # The template writes "- {{PR_FILES}}", so the list continues the first bullet.
+        'PR_FILES': "\n- ".join(f['filename'] for f in pr_data['files']),
+        'PR_DIFF': (pr_diff or '') if include_diff else DIFF_OMITTED,
+    }
+    fill = lambda m: values.get(m.group(1), m.group(0))
+    return _TOKEN.sub(fill, template['system']), _TOKEN.sub(fill, template['user'])
+
+
 def get_security_audit_prompt(pr_data, pr_diff=None, include_diff=True, custom_scan_instructions=None):
     """Generate security audit prompt for Claude Code.
     
