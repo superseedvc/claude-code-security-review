@@ -15,6 +15,7 @@ from claudecode.github_action_audit import (
     AuditError
 )
 from claudecode.findings_filter import FindingsFilter
+from claudecode.constants import FILTER_CLAUDE_MODEL
 
 
 class TestHelperFunctions:
@@ -114,6 +115,7 @@ class TestHelperFunctions:
             mock_filter.assert_called_once_with(
                 use_hard_exclusions=True,
                 use_claude_filtering=True,
+                model=FILTER_CLAUDE_MODEL,
                 api_key='test-key-123',
                 custom_filtering_instructions=None
             )

@@ -15,12 +15,18 @@ import re
 import time 
 
 # Import existing components we can reuse
-from claudecode.prompts import get_security_audit_prompt
+from claudecode.prompts import (
+    PROMPT_TEMPLATE_ENV,
+    get_security_audit_prompt,
+    load_prompt_template,
+    render_prompt_template,
+)
 from claudecode.findings_filter import FindingsFilter
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.constants import (
     EXIT_CONFIGURATION_ERROR,
     DEFAULT_CLAUDE_MODEL,
+    FILTER_CLAUDE_MODEL,
     EXIT_SUCCESS,
     EXIT_GENERAL_ERROR,
     SUBPROCESS_TIMEOUT
@@ -131,9 +137,76 @@ class GitHubActionClient:
         headers['Accept'] = 'application/vnd.github.diff'
         
         response = requests.get(url, headers=headers)
+        if response.status_code == 406:
+            # GitHub refuses to render a diff above its size limit (superseedvc/
+            # superseed-internal#9380). Build the same base...head diff from git
+            # in the checked-out head tree instead of failing the scan.
+            print("[Debug] Diff endpoint answered 406; building the diff locally", file=sys.stderr)
+            return self._filter_generated_files(self._local_pr_diff(repo_name, pr_number))
         response.raise_for_status()
         
         return self._filter_generated_files(response.text)
+
+    def _local_pr_diff(self, repo_name: str, pr_number: int) -> str:
+        """The pull request's diff (merge base to head) computed by git.
+
+        The head commit must be what REPO_PATH has checked out, so the diff is
+        of the pull request's own head. The merge base comes from the compare
+        API and is fetched by SHA when the shallow checkout lacks it. The token
+        reaches git through GIT_CONFIG_* environment variables, never argv.
+        External diff drivers, textconv and hooks are switched off, because the
+        head tree is attacker-authored and its .gitattributes could name them.
+        """
+        pr_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+        response = requests.get(pr_url, headers=self.headers)
+        response.raise_for_status()
+        pr = response.json()
+        base_sha = pr['base']['sha']
+        head_sha = pr['head']['sha']
+
+        compare_url = (f"https://api.github.com/repos/{repo_name}/compare/"
+                       f"{base_sha}...{head_sha}?per_page=1")
+        response = requests.get(compare_url, headers=self.headers)
+        response.raise_for_status()
+        merge_base = response.json()['merge_base_commit']['sha']
+
+        repo_dir = os.environ.get('REPO_PATH') or os.getcwd()
+        safe = ['-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=']
+
+        def git(*args, env=None):
+            return subprocess.run(['git', '-C', repo_dir, *safe, *args],
+                                  capture_output=True, text=True, env=env,
+                                  timeout=600)
+
+        checked_out = git('rev-parse', 'HEAD')
+        if checked_out.returncode != 0 or checked_out.stdout.strip() != head_sha:
+            raise AuditError(
+                f"local diff refused: {repo_dir} has {checked_out.stdout.strip() or 'no commit'} "
+                f"checked out, not the pull request head {head_sha}")
+
+        if git('cat-file', '-e', f'{merge_base}^{{commit}}').returncode != 0:
+            import base64
+            basic = base64.b64encode(f"x-access-token:{self.github_token}".encode()).decode()
+            env = dict(os.environ)
+            env.update({
+                'GIT_CONFIG_COUNT': '1',
+                'GIT_CONFIG_KEY_0': 'http.https://github.com/.extraheader',
+                'GIT_CONFIG_VALUE_0': f'AUTHORIZATION: basic {basic}',
+                'GIT_TERMINAL_PROMPT': '0',
+            })
+            fetched = git('fetch', '--no-tags', '--depth=1',
+                          f'https://github.com/{repo_name}.git', merge_base, env=env)
+            if fetched.returncode != 0:
+                raise AuditError(f"local diff: could not fetch merge base {merge_base}: "
+                                 f"{fetched.stderr.strip()[:300]}")
+
+        diff = git('diff', '--no-ext-diff', '--no-textconv', '--no-color',
+                   merge_base, head_sha)
+        if diff.returncode != 0:
+            raise AuditError(f"local diff: git diff failed: {diff.stderr.strip()[:300]}")
+        if not diff.stdout.strip():
+            raise AuditError(f"local diff: git produced an empty diff for {merge_base}..{head_sha}")
+        return diff.stdout
     
     def _is_excluded(self, filepath: str) -> bool:
         """Check if a file should be excluded based on directory patterns."""
@@ -200,7 +273,7 @@ class SimpleClaudeRunner:
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
     
-    def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
+    def run_security_audit(self, repo_dir: Path, prompt: str, system_prompt: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
         
         Args:
@@ -227,6 +300,10 @@ class SimpleClaudeRunner:
                 '--model', DEFAULT_CLAUDE_MODEL,
                 '--disallowed-tools', 'Bash(ps:*)'
             ]
+            # SuperSeed fork (#10267): a rendered prompt variant's system text, appended to the
+            # CLI's own system prompt as the bank sent it in the system turn.
+            if system_prompt:
+                cmd += ['--append-system-prompt', system_prompt]
             
             # Run Claude Code with retry logic
             NUM_RETRIES = 3
@@ -416,6 +493,7 @@ def initialize_findings_filter(custom_filtering_instructions: Optional[str] = No
             return FindingsFilter(
                 use_hard_exclusions=True,
                 use_claude_filtering=True,
+                model=FILTER_CLAUDE_MODEL,
                 api_key=api_key,
                 custom_filtering_instructions=custom_filtering_instructions
             )
@@ -527,6 +605,11 @@ def main():
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
+
+        # SuperSeed fork: the model comes from the caller's broker read, never from here.
+        if not DEFAULT_CLAUDE_MODEL:
+            print(json.dumps({'error': 'CLAUDE_MODEL is not set: the caller must pass the model its broker read assigned'}))
+            sys.exit(EXIT_CONFIGURATION_ERROR)
         
         # Load custom filtering instructions if provided
         custom_filtering_instructions = None
@@ -550,6 +633,21 @@ def main():
             except Exception as e:
                 logger.warning(f"Failed to read security scan instructions file {scan_file}: {e}")
         
+        # SuperSeed fork (#10267): the prompt variant the caller rendered for its model. A
+        # variable that names a file this cannot read is refused, never ignored: the caller
+        # has already logged the variant it meant to send.
+        prompt_template = None
+        template_file = os.environ.get(PROMPT_TEMPLATE_ENV, '')
+        if template_file:
+            try:
+                prompt_template = load_prompt_template(template_file)
+            except (OSError, ValueError) as e:
+                print(json.dumps({'error': f'{PROMPT_TEMPLATE_ENV} names a prompt template that cannot be used: {e}'}))
+                sys.exit(EXIT_CONFIGURATION_ERROR)
+            print(f"[Info] scan prompt: variant {prompt_template['variant']} from {template_file}", file=sys.stderr)
+        else:
+            print("[Info] scan prompt: the scanner's own (no prompt template named)", file=sys.stderr)
+
         # Initialize components
         try:
             github_client, claude_runner = initialize_clients()
@@ -579,20 +677,27 @@ def main():
             sys.exit(EXIT_GENERAL_ERROR)
                 
         # Generate security audit prompt
-        prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
-        
-        # Run Claude Code security audit
-        # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
-        success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
+        if prompt_template:
+            system_prompt, prompt = render_prompt_template(prompt_template, pr_data, pr_diff)
+            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt, system_prompt=system_prompt)
+        else:
+            prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
+            # Run Claude Code security audit
+            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
         
         # If prompt is too long, retry without diff
         if not success and error_msg == "PROMPT_TOO_LONG":
             print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
-            prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
-            print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
-            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
+            if prompt_template:
+                system_prompt, prompt_without_diff = render_prompt_template(prompt_template, pr_data, pr_diff, include_diff=False)
+                print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
+                success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff, system_prompt=system_prompt)
+            else:
+                prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
+                print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
+                success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
