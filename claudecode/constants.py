@@ -24,5 +24,19 @@ EXIT_GENERAL_ERROR = 1
 EXIT_CONFIGURATION_ERROR = 2
 
 # Subprocess Configuration
-SUBPROCESS_TIMEOUT = 1200  # 20 minutes for Claude Code execution
+def _subprocess_timeout_seconds():
+    """The per-attempt limit on one Claude Code run, in seconds.
+
+    SuperSeed fork (superseedvc/superseed-internal#10763): the caller may set
+    CLAUDECODE_TIMEOUT_MINUTES, a whole number from 1 to 120. Anything else, or
+    nothing, keeps the upstream 20 minutes. A dependency bump timed out at 20
+    minutes three times running on 15 Oct 2026, with no finding.
+    """
+    raw = (os.environ.get('CLAUDECODE_TIMEOUT_MINUTES') or '').strip()
+    if raw.isdigit() and 1 <= int(raw) <= 120:
+        return int(raw) * 60
+    return 1200
+
+
+SUBPROCESS_TIMEOUT = _subprocess_timeout_seconds()  # 20 minutes unless the caller sets it
 
